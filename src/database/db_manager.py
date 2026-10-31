@@ -100,12 +100,28 @@ class DatabaseManager:
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_faults_last_detected ON fault_events (last_detected);")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_faults_severity ON fault_events (severity);")
 
-            # 3. Knowledge base documents / manual chunks
+            # 3. Knowledge base documents & metadata
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS document_metadata (
+                    doc_id TEXT PRIMARY KEY,
+                    doc_name TEXT UNIQUE NOT NULL,
+                    file_size_bytes INTEGER NOT NULL DEFAULT 0,
+                    page_count INTEGER NOT NULL DEFAULT 1,
+                    chunk_count INTEGER NOT NULL DEFAULT 0,
+                    sha256_hash TEXT NOT NULL DEFAULT '',
+                    uploaded_at TEXT NOT NULL,
+                    metadata_json TEXT
+                );
+            """)
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_doc_meta_name ON document_metadata (doc_name);")
+
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS knowledge_documents (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    doc_id TEXT,
                     doc_name TEXT NOT NULL,
                     chunk_index INTEGER NOT NULL,
+                    page_number INTEGER NOT NULL DEFAULT 1,
                     content TEXT NOT NULL,
                     metadata_json TEXT,
                     created_at TEXT NOT NULL,
@@ -114,6 +130,7 @@ class DatabaseManager:
             """)
 
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_kb_doc_name ON knowledge_documents (doc_name);")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_kb_page ON knowledge_documents (doc_name, page_number);")
 
             # 4. Maintenance and action logs
             cursor.execute("""
@@ -328,32 +345,123 @@ class DatabaseManager:
             """, (fault_id,))
             return cursor.rowcount > 0
 
-    # --- Knowledge Documents Persistence ---
+    # --- Knowledge Documents Persistence, Metadata & Deletion ---
 
-    def store_document_chunks(self, doc_name: str, chunks: list[dict[str, Any]]) -> int:
-        """Store extracted and chunked knowledge base text."""
+    def store_document_with_metadata(
+        self,
+        doc_name: str,
+        file_size_bytes: int,
+        page_count: int,
+        sha256_hash: str,
+        chunks: list[dict[str, Any]],
+        extra_meta: dict[str, Any] | None = None
+    ) -> int:
+        """Store extracted and chunked knowledge base text along with full document metadata."""
+        import hashlib
+        doc_id = f"doc_{sha256_hash[:12]}" if sha256_hash else f"doc_{hashlib.sha256(doc_name.encode()).hexdigest()[:12]}"
+        now_iso = datetime.now(timezone.utc).isoformat()
+        extra_meta_json = json.dumps(extra_meta or {})
+
         with self._lock, self.get_connection() as conn:
             cursor = conn.cursor()
-            # Clear previous chunks for same doc to avoid duplication on re-upload
+
+            # 1. Upsert document_metadata
+            cursor.execute("""
+                INSERT INTO document_metadata (
+                    doc_id, doc_name, file_size_bytes, page_count,
+                    chunk_count, sha256_hash, uploaded_at, metadata_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(doc_id) DO UPDATE SET
+                    doc_name = excluded.doc_name,
+                    file_size_bytes = excluded.file_size_bytes,
+                    page_count = excluded.page_count,
+                    chunk_count = excluded.chunk_count,
+                    uploaded_at = excluded.uploaded_at,
+                    metadata_json = excluded.metadata_json
+            """, (
+                doc_id, doc_name, file_size_bytes, page_count,
+                len(chunks), sha256_hash, now_iso, extra_meta_json
+            ))
+
+            # 2. Clear previous chunks for same doc to avoid duplication on re-upload
             cursor.execute("DELETE FROM knowledge_documents WHERE doc_name = ?", (doc_name,))
-            now_iso = datetime.now(timezone.utc).isoformat()
+
+            # 3. Insert chunk records
             count = 0
             for i, chunk in enumerate(chunks):
                 content = chunk.get("content", "")
-                meta_json = json.dumps(chunk.get("metadata", {}))
+                page_num = chunk.get("page", chunk.get("metadata", {}).get("page", 1))
+                chunk_meta = chunk.get("metadata", {})
+                meta_json = json.dumps(chunk_meta)
                 cursor.execute("""
-                    INSERT INTO knowledge_documents (doc_name, chunk_index, content, metadata_json, created_at)
-                    VALUES (?, ?, ?, ?, ?)
-                """, (doc_name, i, content, meta_json, now_iso))
+                    INSERT INTO knowledge_documents (
+                        doc_id, doc_name, chunk_index, page_number, content, metadata_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (doc_id, doc_name, i, int(page_num), content, meta_json, now_iso))
                 count += 1
+
             return count
+
+    def store_document_chunks(self, doc_name: str, chunks: list[dict[str, Any]]) -> int:
+        """Store extracted and chunked knowledge base text (backwards compatible wrapper)."""
+        import hashlib
+        content_all = "".join(c.get("content", "") for c in chunks)
+        sha256_hash = hashlib.sha256(content_all.encode()).hexdigest()
+        max_page = max([c.get("page", c.get("metadata", {}).get("page", 1)) for c in chunks] or [1])
+        return self.store_document_with_metadata(
+            doc_name=doc_name,
+            file_size_bytes=len(content_all.encode("utf-8")),
+            page_count=int(max_page),
+            sha256_hash=sha256_hash,
+            chunks=chunks
+        )
+
+    def delete_document(self, doc_name: str) -> bool:
+        """Completely remove a document, its metadata, and all its chunks from the database."""
+        with self._lock, self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM knowledge_documents WHERE doc_name = ?", (doc_name,))
+            chunks_deleted = cursor.rowcount
+            cursor.execute("DELETE FROM document_metadata WHERE doc_name = ?", (doc_name,))
+            meta_deleted = cursor.rowcount
+            return (chunks_deleted > 0 or meta_deleted > 0)
+
+    def delete_all_documents(self) -> int:
+        """Purge all indexed technical documents and metadata."""
+        with self._lock, self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM knowledge_documents;")
+            cursor.execute("DELETE FROM document_metadata;")
+            return cursor.rowcount
+
+    def get_document_metadata(self, doc_name: str | None = None) -> list[dict[str, Any]]:
+        """Retrieve stored document metadata records."""
+        with self._lock, self.get_connection() as conn:
+            cursor = conn.cursor()
+            if doc_name:
+                cursor.execute("SELECT * FROM document_metadata WHERE doc_name = ?", (doc_name,))
+            else:
+                cursor.execute("SELECT * FROM document_metadata ORDER BY uploaded_at DESC")
+            return [dict(row) for row in cursor.fetchall()]
+
+    def get_chunks_for_document(self, doc_name: str) -> list[dict[str, Any]]:
+        """Retrieve all ordered chunks for a specific document."""
+        with self._lock, self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT id, doc_id, doc_name, chunk_index, page_number, content, metadata_json, created_at
+                FROM knowledge_documents
+                WHERE doc_name = ?
+                ORDER BY chunk_index ASC
+            """, (doc_name,))
+            return [dict(row) for row in cursor.fetchall()]
 
     def get_all_document_chunks(self) -> list[dict[str, Any]]:
         """Retrieve all knowledge document chunks."""
         with self._lock, self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("""
-                SELECT id, doc_name, chunk_index, content, metadata_json, created_at
+                SELECT id, doc_id, doc_name, chunk_index, page_number, content, metadata_json, created_at
                 FROM knowledge_documents
                 ORDER BY doc_name, chunk_index ASC
             """)
@@ -361,13 +469,22 @@ class DatabaseManager:
             return [dict(row) for row in rows]
 
     def list_indexed_documents(self) -> list[dict[str, Any]]:
-        """List summary of indexed documents with chunk counts."""
+        """List summary of indexed documents with enriched metadata."""
         with self._lock, self.get_connection() as conn:
             cursor = conn.cursor()
+            # Left join document_metadata with knowledge_documents count
             cursor.execute("""
-                SELECT doc_name, COUNT(*) as chunk_count, MIN(created_at) as indexed_at
-                FROM knowledge_documents
-                GROUP BY doc_name
+                SELECT
+                    COALESCE(m.doc_name, k.doc_name) AS doc_name,
+                    COALESCE(m.doc_id, '') AS doc_id,
+                    COALESCE(m.file_size_bytes, 0) AS file_size_bytes,
+                    COALESCE(m.page_count, 1) AS page_count,
+                    COUNT(k.id) AS chunk_count,
+                    COALESCE(m.sha256_hash, '') AS sha256_hash,
+                    COALESCE(m.uploaded_at, MIN(k.created_at)) AS indexed_at
+                FROM knowledge_documents k
+                LEFT JOIN document_metadata m ON k.doc_name = m.doc_name
+                GROUP BY k.doc_name
                 ORDER BY indexed_at DESC
             """)
             rows = cursor.fetchall()

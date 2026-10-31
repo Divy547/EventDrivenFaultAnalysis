@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from pathlib import Path
 from typing import Any, Optional
@@ -17,18 +18,50 @@ class PDFProcessor:
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
 
-    def process_pdf(self, pdf_source: Path | str | bytes, doc_name: str) -> list[dict[str, Any]]:
-        """Extract text chunks with metadata from a PDF file path or raw bytes."""
+    def process_pdf_with_metadata(
+        self,
+        pdf_source: Path | str | bytes,
+        doc_name: str
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        """Extract text chunks and complete document metadata using PyMuPDF.
+
+        Returns:
+            Tuple of (doc_metadata: dict, chunks: list[dict])
+        """
         chunks: list[dict[str, Any]] = []
+        doc_metadata: dict[str, Any] = {
+            "doc_name": doc_name,
+            "file_size_bytes": 0,
+            "page_count": 0,
+            "sha256_hash": "",
+            "title": doc_name,
+            "author": "Industrial Documentation",
+        }
 
         try:
             if isinstance(pdf_source, (bytes, bytearray)):
-                doc = pymupdf.open(stream=pdf_source, filetype="pdf")
+                raw_bytes = bytes(pdf_source)
+                doc = pymupdf.open(stream=raw_bytes, filetype="pdf")
+                doc_metadata["file_size_bytes"] = len(raw_bytes)
+                doc_metadata["sha256_hash"] = hashlib.sha256(raw_bytes).hexdigest()
             else:
-                doc = pymupdf.open(str(pdf_source))
+                p = Path(pdf_source)
+                raw_bytes = p.read_bytes()
+                doc = pymupdf.open(str(p))
+                doc_metadata["file_size_bytes"] = len(raw_bytes)
+                doc_metadata["sha256_hash"] = hashlib.sha256(raw_bytes).hexdigest()
 
+            doc_metadata["page_count"] = len(doc)
+            meta = doc.metadata or {}
+            if meta.get("title"):
+                doc_metadata["title"] = meta["title"]
+            if meta.get("author"):
+                doc_metadata["author"] = meta["author"]
+
+            chunk_id = 0
             for page_idx in range(len(doc)):
                 page = doc[page_idx]
+                page_num = page_idx + 1
                 text = page.get_text("text").strip()
                 if not text:
                     continue
@@ -43,37 +76,48 @@ class PDFProcessor:
                     else:
                         if current_chunk:
                             chunks.append({
+                                "chunk_id": chunk_id,
                                 "doc_name": doc_name,
-                                "page": page_idx + 1,
+                                "page": page_num,
                                 "content": current_chunk.strip(),
                                 "metadata": {
                                     "doc_name": doc_name,
-                                    "page": page_idx + 1,
+                                    "page": page_num,
+                                    "chunk_id": chunk_id,
                                     "char_count": len(current_chunk.strip())
                                 }
                             })
+                            chunk_id += 1
                         # Start new chunk with overlap
                         current_chunk = p
 
                 if current_chunk:
                     chunks.append({
+                        "chunk_id": chunk_id,
                         "doc_name": doc_name,
-                        "page": page_idx + 1,
+                        "page": page_num,
                         "content": current_chunk.strip(),
                         "metadata": {
                             "doc_name": doc_name,
-                            "page": page_idx + 1,
+                            "page": page_num,
+                            "chunk_id": chunk_id,
                             "char_count": len(current_chunk.strip())
                         }
                     })
+                    chunk_id += 1
 
             doc.close()
-            logger.info("Extracted %d chunks from %s", len(chunks), doc_name)
-            return chunks
+            logger.info("Extracted %d chunks from %s (%d pages)", len(chunks), doc_name, doc_metadata["page_count"])
+            return doc_metadata, chunks
 
         except Exception as exc:
             logger.error("Failed to extract PDF %s: %s", doc_name, exc)
-            return []
+            return doc_metadata, []
+
+    def process_pdf(self, pdf_source: Path | str | bytes, doc_name: str) -> list[dict[str, Any]]:
+        """Extract text chunks with metadata from a PDF file path or raw bytes (backwards compatible)."""
+        _, chunks = self.process_pdf_with_metadata(pdf_source, doc_name)
+        return chunks
 
     @staticmethod
     def generate_sample_manual(output_path: Path | str) -> Path:
