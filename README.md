@@ -159,6 +159,37 @@ Access the dashboard at `http://localhost:8501`.
 
 ---
 
+## 🖥️ Polished 5-Page Industrial Monitoring Dashboard
+
+The user interface is structured across five dedicated operational pages styled in a dark industrial theme:
+
+1. **🏭 Overview**:
+   - High-level plant health overview and fleet operational score (0–100%).
+   - Monitored motor asset summary cards with health badges (`OPERATIONAL`, `WARNING`, `CRITICAL`, `STANDBY`).
+   - Latest sensor snapshot metrics, active alarm counts, and master simulation controls.
+2. **📊 Live Monitoring**:
+   - Device selector across all three motors (`MOTOR-PUMP-01`, `MOTOR-CONV-02`, `MOTOR-COMP-03`).
+   - Plotly dark-themed interactive engineering waveforms:
+     - **Temperature (°C)** with Warning ($75^\circ\text{C}$) and Critical ($90^\circ\text{C}$) threshold lines.
+     - **Vibration Velocity (mm/s RMS)** with ISO 10816 Zone C ($4.5\text{ mm/s}$) and Zone D ($7.1\text{ mm/s}$) criteria.
+     - **Shaft Speed (RPM)** time-series with nominal speed reference.
+     - **Phase Current (A RMS)** with rated full-load current (FLA) markers.
+   - Dynamic fault injection panel to trigger operational degradation scenarios in real time.
+3. **🚨 Fault Management**:
+   - Live anomaly queue displaying severity badges, occurrence count deduplication, and triggering metrics.
+   - Fault acknowledgement and resolution workflows with **Technician Name** and **Maintenance Notes** inputs saved to SQLite.
+   - Historical incident logs and technician maintenance activity records.
+4. **🤖 AI Diagnosis**:
+   - **Automated Root-Cause Diagnostic Service**: Validated structured JSON containing fault title, severity, empirical observations, grounded possible causes, recommended actions (OSHA LOTO), evidence, verifiable document source citations, and qualified confidence rating.
+   - **Conversational Troubleshooting Assistant**: Multi-turn RAG chat citing verified manual passages, document names, and page numbers.
+   - Transparent engine identification: explicitly indicates `Google Gemini (model)` or `Deterministic Demo Fallback (Offline Mode)` with failure reasons.
+5. **📚 Knowledge Base**:
+   - PyMuPDF PDF manual upload with page count, chunk count, file size, and SHA256 integrity hash.
+   - Document listing with chunk inspection expanders and complete document deletion (atomic SQLite and TF-IDF index purge).
+   - Interactive TF-IDF semantic retrieval tester with cosine similarity ranking.
+
+---
+
 ## 📁 Repository Structure
 
 ```
@@ -168,15 +199,16 @@ HCL_Event_Driven_Fault_Analysis/
 ├── requirements.txt          # Python dependency specifications
 ├── README.md                 # Complete system documentation
 ├── config.py                 # Centralized configuration dataclasses
-├── app.py                    # Streamlit entrypoint application
+├── app.py                    # Streamlit 5-page entrypoint application
 ├── data/
 │   ├── manuals/              # Technical manuals (auto-bootstrapped PDF)
 │   └── iot_fault_diagnosis.db# SQLite database
 ├── src/
 │   ├── models/
-│   │   └── telemetry.py      # Pydantic schemas for telemetry and faults
+│   │   ├── telemetry.py      # Telemetry and FaultEvent Pydantic schemas
+│   │   └── diagnosis.py      # StructuredFaultDiagnosis & ChatMessage schemas
 │   ├── database/
-│   │   └── db_manager.py     # SQLite persistence with WAL mode & indexing
+│   │   └── db_manager.py     # SQLite persistence with WAL mode & metadata
 │   ├── fault_detection/
 │   │   ├── rules.py          # ISO 10816, thermal, and electrical rules
 │   │   └── detector.py       # Deduplicating fault engine
@@ -185,17 +217,17 @@ HCL_Event_Driven_Fault_Analysis/
 │   ├── simulator/
 │   │   └── motor_simulator.py# 3-motor sensor simulator & scenario injector
 │   ├── knowledge/
-│   │   ├── pdf_processor.py  # PyMuPDF manual extraction & sample generator
+│   │   ├── pdf_processor.py  # PyMuPDF manual extraction & metadata hashing
 │   │   ├── tfidf_index.py    # scikit-learn TF-IDF cosine retrieval
-│   │   └── ai_assistant.py   # Gemini API RAG with offline local fallback
-│   ├── services.py           # Long-lived service container
+│   │   └── ai_assistant.py   # Gemini API RAG with offline deterministic fallback
+│   ├── services.py           # Long-lived singleton service container
 │   └── ui/
-│       ├── dashboard_view.py # Live telemetry gauges & Plotly trend charts
-│       ├── faults_view.py    # Alert monitor, deduplication & resolution
-│       ├── simulator_view.py # Multi-motor scenario injection controls
-│       ├── assistant_view.py # Grounded RAG fault diagnosis
-│       ├── knowledge_view.py # PDF manual upload & TF-IDF search tester
-│       └── settings_view.py  # MQTT broker & threshold tuning
+│       ├── theme.py          # Dark industrial CSS and Plotly dark styling
+│       ├── overview_view.py  # Page 1: Plant overview & fleet health summary
+│       ├── monitoring_view.py# Page 2: Live Plotly waveforms & scenario injector
+│       ├── fault_view.py     # Page 3: Fault queue, resolution & maintenance logs
+│       ├── diagnosis_view.py # Page 4: Root-cause diagnosis & RAG chat assistant
+│       └── knowledge_view.py # Page 5: PDF upload, indexing, listing & deletion
 └── tests/
     ├── test_models.py        # Telemetry validation tests
     ├── test_database.py      # SQLite persistence and deduplication tests

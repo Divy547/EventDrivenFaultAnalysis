@@ -312,8 +312,13 @@ class DatabaseManager:
             rows = cursor.fetchall()
             return [dict(row) for row in rows]
 
-    def resolve_fault(self, fault_id: str, technician_note: str | None = None) -> bool:
-        """Mark a fault as RESOLVED with resolution timestamp."""
+    def resolve_fault(
+        self,
+        fault_id: str,
+        technician_note: str | None = None,
+        technician_name: str = "Field Technician"
+    ) -> bool:
+        """Mark a fault as RESOLVED with resolution timestamp and maintenance log."""
         with self._lock, self.get_connection() as conn:
             cursor = conn.cursor()
             now_iso = datetime.now(timezone.utc).isoformat()
@@ -330,9 +335,70 @@ class DatabaseManager:
                 device_id = row["device_id"] if row else "UNKNOWN"
                 cursor.execute("""
                     INSERT INTO maintenance_logs (device_id, fault_id, action_taken, technician, timestamp, notes)
-                    VALUES (?, ?, 'Manual Resolution', 'Operator', ?, ?)
-                """, (device_id, fault_id, now_iso, technician_note))
+                    VALUES (?, ?, 'Corrective Maintenance', ?, ?, ?)
+                """, (device_id, fault_id, technician_name, now_iso, technician_note))
             return updated
+
+    def get_fleet_summary(self, device_ids: list[str]) -> dict[str, Any]:
+        """Aggregate health status and metrics across the entire industrial fleet."""
+        with self._lock, self.get_connection() as conn:
+            cursor = conn.cursor()
+            devices_info: list[dict[str, Any]] = []
+            total_active_critical = 0
+            total_active_warning = 0
+
+            for dev_id in device_ids:
+                # Latest telemetry
+                cursor.execute("""
+                    SELECT * FROM telemetry
+                    WHERE device_id = ?
+                    ORDER BY id DESC LIMIT 1
+                """, (dev_id,))
+                latest_row = cursor.fetchone()
+                latest = dict(latest_row) if latest_row else None
+
+                # Active faults count
+                cursor.execute("""
+                    SELECT
+                        COUNT(CASE WHEN severity = 'CRITICAL' THEN 1 END) AS critical_count,
+                        COUNT(CASE WHEN severity = 'WARNING' THEN 1 END) AS warning_count
+                    FROM fault_events
+                    WHERE device_id = ? AND status IN ('ACTIVE', 'ACKNOWLEDGED')
+                """, (dev_id,))
+                fault_counts = cursor.fetchone()
+                crit_count = fault_counts["critical_count"] if fault_counts else 0
+                warn_count = fault_counts["warning_count"] if fault_counts else 0
+
+                total_active_critical += crit_count
+                total_active_warning += warn_count
+
+                if crit_count > 0:
+                    health_status = "CRITICAL"
+                elif warn_count > 0:
+                    health_status = "WARNING"
+                elif latest:
+                    health_status = "OPERATIONAL"
+                else:
+                    health_status = "STANDBY"
+
+                devices_info.append({
+                    "device_id": dev_id,
+                    "health_status": health_status,
+                    "critical_count": crit_count,
+                    "warning_count": warn_count,
+                    "latest_telemetry": latest,
+                })
+
+            # Calculate Fleet Health Score (%)
+            # Base 100%, deduct 25% for each critical fault and 10% for each warning
+            health_score = max(0, 100 - (total_active_critical * 25) - (total_active_warning * 10))
+
+            return {
+                "devices": devices_info,
+                "fleet_health_score": health_score,
+                "total_critical": total_active_critical,
+                "total_warning": total_active_warning,
+            }
 
     def acknowledge_fault(self, fault_id: str) -> bool:
         """Acknowledge an active fault."""

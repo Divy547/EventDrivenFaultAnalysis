@@ -66,9 +66,19 @@ def test_fault_lifecycle_and_deduplication(temp_db):
     assert active[0]["occurrence_count"] == 2
     assert active[0]["metric_value"] == 79.0
 
-    # Resolve fault
-    res = temp_db.resolve_fault("MOTOR-TEST_OVERHEAT", "Operator checked cooling fan")
+    # Resolve fault with technician name and notes
+    res = temp_db.resolve_fault(
+        "MOTOR-TEST_OVERHEAT",
+        technician_note="Cleaned cooling fan and verified grease port",
+        technician_name="Senior Engineer Bob"
+    )
     assert res is True
+
+    # Check maintenance log
+    logs = temp_db.get_maintenance_logs("MOTOR-TEST")
+    assert len(logs) == 1
+    assert logs[0]["technician"] == "Senior Engineer Bob"
+    assert "Cleaned cooling fan" in logs[0]["notes"]
 
     # No more active faults
     active = temp_db.get_active_faults("MOTOR-TEST")
@@ -78,3 +88,22 @@ def test_fault_lifecycle_and_deduplication(temp_db):
     hist = temp_db.get_fault_history("MOTOR-TEST", status="RESOLVED")
     assert len(hist) == 1
     assert hist[0]["status"] == "RESOLVED"
+
+
+def test_fleet_summary(temp_db):
+    temp_db.insert_telemetry(MotorTelemetry(
+        device_id="MOTOR-PUMP-01",
+        temperature=52.0,
+        vibration=1.5,
+        current=25.0,
+        voltage=230.0,
+        rpm=1450.0,
+        acoustic_db=65.0
+    ))
+    summary = temp_db.get_fleet_summary(["MOTOR-PUMP-01", "MOTOR-CONV-02"])
+    assert len(summary["devices"]) == 2
+    assert summary["fleet_health_score"] == 100
+    pump_info = next(d for d in summary["devices"] if d["device_id"] == "MOTOR-PUMP-01")
+    assert pump_info["health_status"] == "OPERATIONAL"
+    conv_info = next(d for d in summary["devices"] if d["device_id"] == "MOTOR-CONV-02")
+    assert conv_info["health_status"] == "STANDBY"

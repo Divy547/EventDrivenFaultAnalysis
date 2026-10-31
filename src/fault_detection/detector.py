@@ -135,14 +135,19 @@ class FaultDetector:
             if telemetry.vibration < self.thresholds.vibration_warning:
                 self.resolve_fault(vib_fault_id, "Auto-resolved: Vibration levels returned within ISO 10816 limits")
 
-    def resolve_fault(self, fault_id: str, technician_note: str = "Resolved") -> bool:
+    def resolve_fault(
+        self,
+        fault_id: str,
+        technician_note: str = "Resolved",
+        technician_name: str = "Field Technician"
+    ) -> bool:
         """Explicitly resolve a fault."""
         if fault_id in self._active_faults_cache:
             self._active_faults_cache[fault_id].status = "RESOLVED"
             self._active_faults_cache[fault_id].resolved_at = datetime.now(timezone.utc)
             del self._active_faults_cache[fault_id]
 
-        return self.db.resolve_fault(fault_id, technician_note)
+        return self.db.resolve_fault(fault_id, technician_note, technician_name=technician_name)
 
     def acknowledge_fault(self, fault_id: str) -> bool:
         """Acknowledge a fault."""
