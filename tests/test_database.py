@@ -107,3 +107,55 @@ def test_fleet_summary(temp_db):
     assert pump_info["health_status"] == "OPERATIONAL"
     conv_info = next(d for d in summary["devices"] if d["device_id"] == "MOTOR-CONV-02")
     assert conv_info["health_status"] == "STANDBY"
+
+
+def test_schema_migration_backward_compatibility(tmp_path):
+    """Verify that an older schema lacking page_number or doc_id is safely migrated."""
+    old_db_path = tmp_path / "legacy_v1.db"
+
+    # 1. Simulate an old v1 database created prior to page_number introduction
+    import sqlite3
+    conn = sqlite3.connect(str(old_db_path))
+    conn.execute("""
+        CREATE TABLE knowledge_documents (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            doc_name TEXT NOT NULL,
+            chunk_index INTEGER NOT NULL,
+            content TEXT NOT NULL,
+            metadata_json TEXT,
+            created_at TEXT NOT NULL,
+            UNIQUE(doc_name, chunk_index)
+        );
+    """)
+    conn.execute("""
+        INSERT INTO knowledge_documents (doc_name, chunk_index, content, metadata_json, created_at)
+        VALUES ('legacy_manual.pdf', 0, 'Old chunk content', '{\"page\": 3}', '2026-10-31T12:00:00Z');
+    """)
+    conn.commit()
+    conn.close()
+
+    # 2. Instantiate DatabaseManager over the legacy database
+    db = DatabaseManager(db_path=old_db_path)
+
+    # 3. Verify columns were added, indices created, and existing data was preserved
+    conn2 = sqlite3.connect(str(old_db_path))
+    cursor = conn2.cursor()
+
+    cols = [r[1] for r in cursor.execute("PRAGMA table_info(knowledge_documents)").fetchall()]
+    assert "page_number" in cols
+    assert "doc_id" in cols
+
+    indexes = [r[1] for r in cursor.execute("PRAGMA index_list(knowledge_documents)").fetchall()]
+    assert "idx_kb_page" in indexes
+    assert "idx_kb_doc_name" in indexes
+
+    row = cursor.execute("SELECT doc_name, page_number, content FROM knowledge_documents WHERE id = 1").fetchone()
+    assert row[0] == "legacy_manual.pdf"
+    assert row[1] == 3  # Correctly backfilled from metadata_json {"page": 3}
+    assert row[2] == "Old chunk content"
+
+    conn2.close()
+
+    # 4. Verify idempotency on restart
+    db_reopened = DatabaseManager(db_path=old_db_path)
+    assert db_reopened is not None

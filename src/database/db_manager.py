@@ -49,11 +49,11 @@ class DatabaseManager:
             conn.close()
 
     def init_schema(self) -> None:
-        """Create database tables and performance indices if not present."""
+        """Create database tables, execute safe idempotent migrations, and create performance indices."""
         with self._lock, self.get_connection() as conn:
             cursor = conn.cursor()
 
-            # 1. Telemetry readings table
+            # 1. Base table creation (with IF NOT EXISTS)
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS telemetry (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -72,11 +72,6 @@ class DatabaseManager:
                 );
             """)
 
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_telemetry_device_time ON telemetry (device_id, timestamp);")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_telemetry_timestamp ON telemetry (timestamp);")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_telemetry_state ON telemetry (state);")
-
-            # 2. Fault events table with deduplication and tracking fields
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS fault_events (
                     fault_id TEXT PRIMARY KEY,
@@ -96,11 +91,6 @@ class DatabaseManager:
                 );
             """)
 
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_faults_device_status ON fault_events (device_id, status);")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_faults_last_detected ON fault_events (last_detected);")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_faults_severity ON fault_events (severity);")
-
-            # 3. Knowledge base documents & metadata
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS document_metadata (
                     doc_id TEXT PRIMARY KEY,
@@ -113,7 +103,6 @@ class DatabaseManager:
                     metadata_json TEXT
                 );
             """)
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_doc_meta_name ON document_metadata (doc_name);")
 
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS knowledge_documents (
@@ -129,10 +118,6 @@ class DatabaseManager:
                 );
             """)
 
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_kb_doc_name ON knowledge_documents (doc_name);")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_kb_page ON knowledge_documents (doc_name, page_number);")
-
-            # 4. Maintenance and action logs
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS maintenance_logs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -145,6 +130,111 @@ class DatabaseManager:
                     FOREIGN KEY(fault_id) REFERENCES fault_events(fault_id)
                 );
             """)
+
+            # 2. Execute backward-compatible idempotent migrations BEFORE index creation
+            self._run_migrations(cursor)
+
+            # 3. Create performance indices (guaranteed to succeed now that all columns exist)
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_telemetry_device_time ON telemetry (device_id, timestamp);")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_telemetry_timestamp ON telemetry (timestamp);")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_telemetry_state ON telemetry (state);")
+
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_faults_device_status ON fault_events (device_id, status);")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_faults_last_detected ON fault_events (last_detected);")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_faults_severity ON fault_events (severity);")
+
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_doc_meta_name ON document_metadata (doc_name);")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_kb_doc_name ON knowledge_documents (doc_name);")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_kb_page ON knowledge_documents (doc_name, page_number);")
+
+    def _run_migrations(self, cursor: sqlite3.Cursor) -> None:
+        """Perform idempotent, backward-compatible schema migrations.
+
+        Safely inspects existing tables and adds missing columns before index creation.
+        Preserves all existing records across tables.
+        """
+        def get_column_names(table_name: str) -> set[str]:
+            cursor.execute(f"PRAGMA table_info({table_name});")
+            return {row["name"] for row in cursor.fetchall()}
+
+        # Migration 1: knowledge_documents (add missing page_number and doc_id)
+        kd_cols = get_column_names("knowledge_documents")
+        if kd_cols:
+            if "page_number" not in kd_cols:
+                cursor.execute("ALTER TABLE knowledge_documents ADD COLUMN page_number INTEGER NOT NULL DEFAULT 1;")
+                # Backfill page_number from metadata_json if page info exists
+                cursor.execute("SELECT id, metadata_json FROM knowledge_documents WHERE metadata_json IS NOT NULL;")
+                rows = cursor.fetchall()
+                for r in rows:
+                    try:
+                        if r["metadata_json"]:
+                            meta = json.loads(r["metadata_json"])
+                            p = meta.get("page", meta.get("page_number"))
+                            if p:
+                                cursor.execute(
+                                    "UPDATE knowledge_documents SET page_number = ? WHERE id = ?",
+                                    (int(p), r["id"])
+                                )
+                    except Exception:
+                        pass
+
+            if "doc_id" not in kd_cols:
+                cursor.execute("ALTER TABLE knowledge_documents ADD COLUMN doc_id TEXT;")
+                # Backfill doc_id deterministically
+                cursor.execute("SELECT DISTINCT doc_name FROM knowledge_documents WHERE doc_id IS NULL;")
+                doc_names = [row["doc_name"] for row in cursor.fetchall()]
+                import hashlib
+                for dname in doc_names:
+                    generated_doc_id = f"doc_{hashlib.sha256(dname.encode()).hexdigest()[:12]}"
+                    cursor.execute(
+                        "UPDATE knowledge_documents SET doc_id = ? WHERE doc_name = ?",
+                        (generated_doc_id, dname)
+                    )
+
+        # Migration 2: document_metadata backfill if documents exist
+        cursor.execute("SELECT COUNT(*) as count FROM document_metadata;")
+        meta_count = cursor.fetchone()["count"]
+        if meta_count == 0 and kd_cols:
+            cursor.execute("""
+                SELECT doc_name, doc_id, COUNT(*) as chunks, MAX(page_number) as max_page, MIN(created_at) as created_at
+                FROM knowledge_documents
+                GROUP BY doc_name
+            """)
+            existing_docs = cursor.fetchall()
+            import hashlib
+            for edoc in existing_docs:
+                d_name = edoc["doc_name"]
+                d_id = edoc["doc_id"] or f"doc_{hashlib.sha256(d_name.encode()).hexdigest()[:12]}"
+                p_count = int(edoc["max_page"] or 1)
+                c_count = int(edoc["chunks"] or 0)
+                up_at = edoc["created_at"] or datetime.now(timezone.utc).isoformat()
+                cursor.execute("""
+                    INSERT OR IGNORE INTO document_metadata (
+                        doc_id, doc_name, file_size_bytes, page_count, chunk_count, sha256_hash, uploaded_at, metadata_json
+                    ) VALUES (?, ?, 0, ?, ?, '', ?, '{}')
+                """, (d_id, d_name, p_count, c_count, up_at))
+
+        # Migration 3: fault_events (ensure occurrence_count, first_detected, last_detected, resolved_at)
+        fe_cols = get_column_names("fault_events")
+        if fe_cols:
+            if "occurrence_count" not in fe_cols:
+                cursor.execute("ALTER TABLE fault_events ADD COLUMN occurrence_count INTEGER DEFAULT 1;")
+            if "first_detected" not in fe_cols:
+                cursor.execute("ALTER TABLE fault_events ADD COLUMN first_detected TEXT;")
+                cursor.execute("UPDATE fault_events SET first_detected = timestamp WHERE first_detected IS NULL;")
+            if "last_detected" not in fe_cols:
+                cursor.execute("ALTER TABLE fault_events ADD COLUMN last_detected TEXT;")
+                cursor.execute("UPDATE fault_events SET last_detected = timestamp WHERE last_detected IS NULL;")
+            if "resolved_at" not in fe_cols:
+                cursor.execute("ALTER TABLE fault_events ADD COLUMN resolved_at TEXT;")
+
+        # Migration 4: telemetry (ensure pressure_bar, power_factor)
+        tel_cols = get_column_names("telemetry")
+        if tel_cols:
+            if "pressure_bar" not in tel_cols:
+                cursor.execute("ALTER TABLE telemetry ADD COLUMN pressure_bar REAL;")
+            if "power_factor" not in tel_cols:
+                cursor.execute("ALTER TABLE telemetry ADD COLUMN power_factor REAL DEFAULT 0.88;")
 
     # --- Telemetry Ingestion & Querying ---
 
