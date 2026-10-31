@@ -229,7 +229,8 @@ class DatabaseManager:
             if existing:
                 cursor.execute("""
                     UPDATE fault_events
-                    SET metric_value = ?,
+                    SET severity = ?,
+                        metric_value = ?,
                         threshold_value = ?,
                         message = ?,
                         occurrence_count = occurrence_count + 1,
@@ -237,6 +238,7 @@ class DatabaseManager:
                         status = 'ACTIVE'
                     WHERE fault_id = ?
                 """, (
+                    fault.severity,
                     fault.metric_value,
                     fault.threshold_value,
                     fault.message,

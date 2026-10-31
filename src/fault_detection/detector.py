@@ -89,6 +89,8 @@ class FaultDetector:
                     cached_event.occurrence_count += 1
                     cached_event.last_detected = now
                     cached_event.metric_value = event.metric_value
+                    cached_event.threshold_value = event.threshold_value
+                    cached_event.severity = event.severity
                     cached_event.message = event.message
                     self.db.insert_or_update_fault(cached_event)
                     detected_events.append(cached_event)
